@@ -1,3 +1,5 @@
+using System.Net.Mail;
+using System.Net;
 using System.Reflection;
 using System.Text;
 using System.Text.Json.Serialization;
@@ -11,8 +13,9 @@ using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using Para.Api.Middleware;
 using Para.Api.Service;
+using Para.Api.Services;
 using Para.Base;
-using Para.Base.Log;
+/*using Para.Base.Log;*/
 using Para.Base.Token;
 using Para.Bussiness;
 using Para.Bussiness.Cqrs;
@@ -21,8 +24,10 @@ using Para.Bussiness.Token;
 using Para.Bussiness.Validation;
 using Para.Data.Context;
 using Para.Data.UnitOfWork;
+using RabbitMQ.Client;
 using Serilog;
 using StackExchange.Redis;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Para.Api;
 
@@ -72,6 +77,11 @@ public class Startup
 
         services.AddScoped<ITokenService, TokenService>();
         services.AddSingleton<INotificationService, NotificationService>();
+
+        services.AddHangfire(x => x.UseSqlServerStorage(Configuration.GetConnectionString("HangfireConnection")));
+        services.AddHangfireServer();
+
+        services.AddTransient<EmailQueueService>();
 
         services.AddAuthentication(x =>
         {
@@ -131,12 +141,12 @@ public class Startup
         });
         
         
-        services.AddHangfire(configuration => configuration
+        /*services.AddHangfire(configuration => configuration
             .SetDataCompatibilityLevel(CompatibilityLevel.Version_180)
             .UseSimpleAssemblyNameTypeSerializer()
             .UseRecommendedSerializerSettings()
             .UseSqlServerStorage(Configuration.GetConnectionString("HangfireConnection")));
-        services.AddHangfireServer();
+        services.AddHangfireServer();*/
         
 
         services.AddScoped<ISessionContext>(provider =>
@@ -149,7 +159,7 @@ public class Startup
         });
     }
 
-    public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+    public void Configure(IApplicationBuilder app, IWebHostEnvironment env, IRecurringJobManager recurringJobs, IServiceProvider serviceProvider)
     {
         if (env.IsDevelopment())
         {
@@ -161,7 +171,8 @@ public class Startup
 
         app.UseMiddleware<HeartbeatMiddleware>();
         app.UseMiddleware<ErrorHandlerMiddleware>();
-        Action<RequestProfilerModel> requestResponseHandler = requestProfilerModel =>
+
+        /*Action<RequestProfilerModel> requestResponseHandler = requestProfilerModel =>
         {
             Log.Information("-------------Request-Begin------------");
             Log.Information(requestProfilerModel.Request);
@@ -169,9 +180,12 @@ public class Startup
             Log.Information(requestProfilerModel.Response);
             Log.Information("-------------Request-End------------");
         };
-        app.UseMiddleware<RequestLoggingMiddleware>(requestResponseHandler);
+        app.UseMiddleware<RequestLoggingMiddleware>(requestResponseHandler);*/
 
-        app.UseHangfireDashboard();
+        app.UseHangfireDashboard("/hangfire");
+        app.UseHangfireServer();
+
+        
 
         app.UseHttpsRedirection();
         app.UseAuthentication();
@@ -214,5 +228,49 @@ public class Startup
             await context.Response.WriteAsync($"Service2 : {service2.Counter}\n");
             await context.Response.WriteAsync($"Service3 : {service3.Counter}\n");
         });
+
+        var emailQueueService = serviceProvider.GetService<IEmailQueueService>();
+        if (emailQueueService != null)
+        {
+            emailQueueService.QueueEmail("Initial email to ensure queue is created"); 
+        }
+
+        recurringJobs.AddOrUpdate(
+            "send-emails",
+            () => SendQueuedEmails(serviceProvider.GetService<IConfiguration>()),
+            "*/5 * * * * *"); 
     }
+
+    public static void SendQueuedEmails(IConfiguration configuration)
+    {
+        var factory = new ConnectionFactory() { HostName = "localhost" };
+        using (var connection = factory.CreateConnection())
+        using (var channel = connection.CreateModel())
+        {
+            var result = channel.BasicGet("emailQueue", true);
+            if (result != null)
+            {
+                var body = result.Body.ToArray();
+                var email = Encoding.UTF8.GetString(body);
+
+                try
+                {
+                    var smtpClient = new SmtpClient(configuration["EmailSettings:SmtpServer"])
+                    {
+                        Port = int.Parse(configuration["EmailSettings:SmtpPort"]),
+                        Credentials = new NetworkCredential(configuration["EmailSettings:SmtpUser"], configuration["EmailSettings:SmtpPass"]),
+                        EnableSsl = false,
+                    };
+
+                    smtpClient.Send(configuration["EmailSettings:SmtpUser"], email, "Test Subject", "Test Body");
+                    Console.WriteLine($"Email sent to {email} at {DateTime.Now}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Failed to send email: {ex.Message}");
+                }
+            }
+        }
+    }
+
 }

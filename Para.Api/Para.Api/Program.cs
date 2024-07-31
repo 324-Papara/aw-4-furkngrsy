@@ -1,3 +1,4 @@
+using Hangfire;
 using Serilog;
 
 namespace Para.Api;
